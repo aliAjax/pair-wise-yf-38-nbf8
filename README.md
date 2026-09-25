@@ -25,6 +25,20 @@ python3 app.py --db ./data.db --port 8304
 ## 核心对象
 
 - `dataset`：受控数据集；`application`：访问申请；`grant`：限时数据使用凭证。
+- `emergency_access`：事故排查时的紧急访问单（别名 `emergencies` / `emergency_accesses`）。
+
+## 紧急访问单流程
+
+事故排查可临时放行受控数据，状态机为 `pending → active → expired → reviewed`（另有 `rejected`、`revoked` 终态）。
+
+- **发起**（`applicant`/`admin`）：必填 `incident_id`（事故编号）、`dataset_id`（数据集）、`purpose`（用途）、`expires_at`（截止时间，ISO 8601）；申请人取请求身份，不能冒填。
+- **批准**（`committee`/`admin` 任一人即可）：申请人不能自批；截止时间过后单据自动失效，无法再批准。
+- **不受理**：同一事故在同一数据集已有未结束单据（`pending`/`active`/`expired`）；数据集上存在未到期的普通有效 `grant`；前一张紧急单尚未完成事后复核；截止时间已过。
+- **到期失效**：读取或查询时惰性判定，过了截止时间自动置为 `expired`，响应数据中带 `remaining_seconds`、`expired`、`finished` 字段。
+- **事后复核**（`auditor`/`admin`）：`finding=compliant` 结案为 `reviewed`；`finding=unauthorized` 并填写 `reason` 时撤销凭证（状态 `revoked`）。
+- 数据集曾有越权撤销记录后，再次申请同一数据集必须提交 `remediation_note` 补充说明（普通 `application` 同理）。
+
+复核完成后同一事故/数据集才能再开新单。
 
 ## 主要接口
 
