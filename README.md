@@ -25,6 +25,15 @@ python3 app.py --db ./data.db --port 8304
 ## 核心对象
 
 - `dataset`：受控数据集；`application`：访问申请；`grant`：限时数据使用凭证。
+- `emergency_ticket`：事故排查用的紧急访问单，字段含`incident_id`、`dataset_id`、`applicant_id`、`purpose`、`expires_at`。
+
+## 紧急访问单规则
+
+- 任一委员会成员（`committee`）可批准，申请人不能批准自己的单；`auditor`负责事后复核。
+- 同一事故在同一数据集只允许一张未结束（`pending`/`active`/`expired`）的单。
+- 申请人持有该数据集有效普通凭证，或前一张单尚未完成复核时，新单不予受理。
+- 截止时间后单子失效（`expire`），审计员复核：通过则`close`，认定越权则`revoke`并记录原因。
+- 被撤销过的申请人再申请同一数据集时必须填写`explanation`补充说明。
 
 ## 主要接口
 

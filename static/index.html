@@ -6,29 +6,211 @@
   <title>基因组数据访问治理</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2937; }
-    main { max-width: 820px; margin: auto; }
+    main { max-width: 960px; margin: auto; }
     pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; }
     button { padding: .5rem .8rem; cursor: pointer; }
+    fieldset { border: 1px solid #d1d5db; border-radius: 8px; margin-bottom: 1rem; }
+    label { display: block; margin: .4rem 0; }
+    input, select { padding: .3rem; min-width: 16rem; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #e5e7eb; padding: .4rem .6rem; text-align: left; font-size: .9rem; }
+    .countdown { font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .expired { color: #b91c1c; }
+    .actions button { margin: .1rem; padding: .25rem .5rem; font-size: .8rem; }
   </style>
 </head>
 <body>
 <main>
   <h1>基因组数据访问治理</h1>
-  <p>这是最小演示页面。使用浏览器或 curl 调用 JSON API。</p>
   <p><button onclick="checkHealth()">检查服务状态</button></p>
   <pre id="result">等待操作</pre>
-  <h2>常用接口</h2>
-  <pre>GET  /health
-GET  /api/&lt;kind&gt;
-POST /api/&lt;kind&gt;
-GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+
+  <h2>紧急访问单</h2>
+  <fieldset>
+    <legend>当前身份（随请求头发送）</legend>
+    <label>用户 <input id="userId" value="researcher-1"></label>
+    <label>角色
+      <select id="role">
+        <option value="applicant">applicant（申请人）</option>
+        <option value="committee">committee（委员会）</option>
+        <option value="auditor">auditor（审计员）</option>
+        <option value="admin">admin</option>
+        <option value="viewer">viewer</option>
+      </select>
+    </label>
+  </fieldset>
+
+  <fieldset>
+    <legend>发起紧急访问单</legend>
+    <label>事故编号 <input id="incidentId" placeholder="INC-2026-001"></label>
+    <label>数据集 <select id="datasetId"></select></label>
+    <label>申请人 <input id="applicantId" placeholder="留空则使用当前用户"></label>
+    <label>用途 <input id="purpose" placeholder="事故排查"></label>
+    <label>截止时间 <input id="expiresAt" type="datetime-local"></label>
+    <label>补充说明（曾被认定越权时必填）<input id="explanation"></label>
+    <p><button onclick="createTicket()">提交申请</button></p>
+  </fieldset>
+
+  <p><button onclick="refreshTickets()">刷新列表</button></p>
+  <table>
+    <thead>
+      <tr><th>事故</th><th>数据集</th><th>申请人</th><th>状态</th><th>剩余时间</th><th>备注</th><th>操作</th></tr>
+    </thead>
+    <tbody id="tickets"></tbody>
+  </table>
 </main>
 <script>
-async function checkHealth() {
-  const response = await fetch('/health');
-  document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
+const STATUS_LABELS = {
+  pending: '待批准',
+  active: '生效中',
+  expired: '已失效待复核',
+  closed: '复核通过',
+  revoked: '越权已撤销',
+};
+let tickets = [];
+
+function authHeaders() {
+  return {
+    'Content-Type': 'application/json',
+    'X-User-Id': document.getElementById('userId').value || 'anonymous',
+    'X-Role': document.getElementById('role').value,
+  };
 }
+
+function show(payload) {
+  document.getElementById('result').textContent =
+    typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
+}
+
+async function request(path, options) {
+  const response = await fetch(path, options);
+  const body = await response.json();
+  if (!response.ok) {
+    show(body);
+    throw new Error(body.error || response.statusText);
+  }
+  return body;
+}
+
+async function checkHealth() {
+  show(await (await fetch('/health')).json());
+}
+
+async function loadDatasets() {
+  try {
+    const data = await request('/api/datasets');
+    const select = document.getElementById('datasetId');
+    select.innerHTML = '';
+    if (!data.items.length) {
+      select.innerHTML = '<option value="">（暂无数据集，请先通过 API 创建）</option>';
+      return;
+    }
+    for (const item of data.items) {
+      const option = document.createElement('option');
+      option.value = item.id;
+      option.textContent = (item.data.name || '') + '（' + item.id.slice(0, 8) + '…）';
+      select.appendChild(option);
+    }
+  } catch (err) { /* 错误已展示 */ }
+}
+
+async function createTicket() {
+  const expiresLocal = document.getElementById('expiresAt').value;
+  const payload = {
+    incident_id: document.getElementById('incidentId').value,
+    dataset_id: document.getElementById('datasetId').value,
+    applicant_id: document.getElementById('applicantId').value || document.getElementById('userId').value,
+    purpose: document.getElementById('purpose').value,
+    expires_at: expiresLocal ? new Date(expiresLocal).toISOString() : '',
+  };
+  const explanation = document.getElementById('explanation').value;
+  if (explanation) payload.explanation = explanation;
+  try {
+    show(await request('/api/emergency_tickets', {
+      method: 'POST', headers: authHeaders(), body: JSON.stringify(payload),
+    }));
+    await refreshTickets();
+  } catch (err) { /* 错误已展示 */ }
+}
+
+async function act(ticket, action, data) {
+  try {
+    show(await request('/api/entities/' + ticket.id + '/actions', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({action, data: data || {}, expected_version: ticket.version}),
+    }));
+    await refreshTickets();
+  } catch (err) { /* 错误已展示 */ }
+}
+
+function revokeTicket(ticket) {
+  const reason = prompt('认定越权的撤销原因');
+  if (reason) act(ticket, 'revoke', {reason});
+}
+
+function remaining(ticket) {
+  if (ticket.status === 'closed' || ticket.status === 'revoked') return {text: '—', expired: false};
+  const diff = new Date(ticket.data.expires_at) - Date.now();
+  if (isNaN(diff)) return {text: '—', expired: false};
+  if (diff <= 0) return {text: '已到期', expired: true};
+  const hours = Math.floor(diff / 3600000);
+  const minutes = Math.floor(diff / 60000) % 60;
+  const seconds = Math.floor(diff / 1000) % 60;
+  return {text: hours + '时 ' + minutes + '分 ' + seconds + '秒', expired: false};
+}
+
+function cell(row, text) {
+  const td = document.createElement('td');
+  td.textContent = text;
+  row.appendChild(td);
+  return td;
+}
+
+function render() {
+  const tbody = document.getElementById('tickets');
+  tbody.innerHTML = '';
+  for (const ticket of tickets) {
+    const row = document.createElement('tr');
+    cell(row, ticket.data.incident_id || '');
+    cell(row, (ticket.data.dataset_id || '').slice(0, 8) + '…');
+    cell(row, ticket.data.applicant_id || '');
+    cell(row, STATUS_LABELS[ticket.status] || ticket.status);
+    const left = remaining(ticket);
+    const countdown = cell(row, left.text);
+    countdown.className = 'countdown' + (left.expired ? ' expired' : '');
+    cell(row, ticket.data.reason || ticket.data.explanation || '');
+    const actions = cell(row, '');
+    actions.className = 'actions';
+    const addButton = (label, handler) => {
+      const button = document.createElement('button');
+      button.textContent = label;
+      button.onclick = handler;
+      actions.appendChild(button);
+    };
+    if (ticket.status === 'pending') addButton('批准', () => act(ticket, 'approve'));
+    if (ticket.status === 'pending' || ticket.status === 'active') {
+      addButton('标记失效', () => act(ticket, 'expire'));
+    }
+    if (ticket.status === 'active' || ticket.status === 'expired') {
+      addButton('复核通过', () => act(ticket, 'close'));
+      addButton('认定越权并撤销', () => revokeTicket(ticket));
+    }
+    tbody.appendChild(row);
+  }
+}
+
+async function refreshTickets() {
+  try {
+    const data = await request('/api/emergency_tickets');
+    tickets = data.items;
+    render();
+  } catch (err) { /* 错误已展示 */ }
+}
+
+loadDatasets();
+refreshTickets();
+setInterval(render, 1000);
 </script>
 </body>
 </html>

@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from .domain import (
     ConflictError,
@@ -39,18 +39,81 @@ def _validate_grant_activate(actor, entity, data, lookup):
     return {"activated_by": actor.user_id}
 
 
-CUSTOM_CREATE = {'dataset': _validate_dataset, 'application': _validate_application}
-CUSTOM_TRANSITIONS = {('application', 'approve'): _validate_approve, ('grant', 'activate'): _validate_grant_activate}
+def _utcnow():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+EMERGENCY_OPEN_STATUSES = ("pending", "active", "expired")
+
+
+def _validate_emergency_ticket(actor, data, lookup):
+    dataset = _find_one(lookup, "dataset", "id", data.get("dataset_id"))
+    if not dataset:
+        raise ValidationError("dataset does not exist")
+    if not data.get("purpose", "").strip():
+        raise ValidationError("purpose is required")
+    now = _utcnow()
+    if str(data.get("expires_at")) <= now:
+        raise ValidationError("expires_at must be in the future")
+    if lookup is None:
+        return
+    dataset_id = data.get("dataset_id")
+    applicant_id = data.get("applicant_id")
+    for ticket in lookup("emergency_ticket", "incident_id", data.get("incident_id")) or []:
+        if ticket["data"].get("dataset_id") == dataset_id and ticket["status"] in EMERGENCY_OPEN_STATUSES:
+            raise ConflictError("an unfinished emergency ticket already exists for this incident and dataset")
+    for grant in lookup("grant", "dataset_id", dataset_id) or []:
+        if grant["status"] != "active":
+            continue
+        if grant["data"].get("recipient") != applicant_id:
+            continue
+        grant_expires = grant["data"].get("expires_at")
+        if not grant_expires or valid_grant_window(grant_expires, now):
+            raise ConflictError("applicant already holds a valid grant for this dataset")
+    revoked_before = any(
+        ticket["data"].get("dataset_id") == dataset_id and ticket["status"] == "revoked"
+        for ticket in lookup("emergency_ticket", "applicant_id", applicant_id) or []
+    )
+    if revoked_before and not str(data.get("explanation") or "").strip():
+        raise ValidationError("a previous revocation on this dataset requires an explanation")
+
+
+def _validate_emergency_approve(actor, entity, data, lookup):
+    if actor.user_id == entity["data"].get("applicant_id"):
+        raise PermissionDenied("applicant cannot approve their own emergency ticket")
+    now = _utcnow()
+    if str(entity["data"].get("expires_at")) <= now:
+        raise ValidationError("emergency ticket deadline has passed")
+    return {"approved_by": actor.user_id, "approved_at": now}
+
+
+def _validate_emergency_expire(actor, entity, data, lookup):
+    expired_at = str(data.get("expired_at") or _utcnow())
+    if expired_at < str(entity["data"].get("expires_at")):
+        raise ValidationError("emergency ticket deadline has not been reached")
+    return {"expired_at": expired_at}
+
+
+def _validate_emergency_close(actor, entity, data, lookup):
+    return {"reviewed_by": actor.user_id, "reviewed_at": _utcnow()}
+
+
+def _validate_emergency_revoke(actor, entity, data, lookup):
+    return {"revoked_by": actor.user_id, "revoked_at": _utcnow()}
+
+
+CUSTOM_CREATE = {'dataset': _validate_dataset, 'application': _validate_application, 'emergency_ticket': _validate_emergency_ticket}
+CUSTOM_TRANSITIONS = {('application', 'approve'): _validate_approve, ('grant', 'activate'): _validate_grant_activate, ('emergency_ticket', 'approve'): _validate_emergency_approve, ('emergency_ticket', 'expire'): _validate_emergency_expire, ('emergency_ticket', 'close'): _validate_emergency_close, ('emergency_ticket', 'revoke'): _validate_emergency_revoke}
 
 
 class RuleEngine:
-    ALIASES = {'datasets': 'dataset', 'applications': 'application', 'grants': 'grant'}
-    INITIAL_STATUS = {'dataset': 'registered', 'application': 'draft', 'grant': 'issued'}
-    TRANSITIONS = {'dataset': {'restrict': (('registered',), 'restricted'), 'publish': (('restricted',), 'published')}, 'application': {'submit': (('draft',), 'submitted'), 'review': (('submitted',), 'under_review'), 'approve': (('under_review',), 'approved'), 'reject': (('under_review',), 'rejected'), 'withdraw': (('submitted', 'under_review'), 'withdrawn')}, 'grant': {'activate': (('issued',), 'active'), 'revoke': (('active',), 'revoked'), 'expire': (('active',), 'expired')}}
-    CREATE_REQUIRED = {'dataset': ('name', 'access_policy'), 'application': ('dataset_id', 'applicant_id', 'purpose'), 'grant': ('application_id', 'dataset_id', 'recipient')}
-    ACTION_REQUIRED = {('dataset', 'restrict'): ('reason',), ('application', 'review'): ('committee_id',), ('application', 'approve'): ('approvals', 'terms', 'expires_at'), ('application', 'reject'): ('reason',), ('application', 'withdraw'): ('reason',), ('grant', 'activate'): ('starts_at', 'expires_at'), ('grant', 'revoke'): ('reason',), ('grant', 'expire'): ('expired_at',)}
-    CREATE_ROLES = {'dataset': ('admin', 'committee'), 'application': ('admin', 'applicant'), 'grant': ('admin', 'committee')}
-    ROLE_ACTIONS = {'restrict': ('admin', 'committee'), 'publish': ('admin', 'committee'), 'submit': ('admin', 'applicant'), 'review': ('admin', 'committee'), 'approve': ('admin', 'committee'), 'reject': ('admin', 'committee'), 'withdraw': ('admin', 'applicant'), 'activate': ('admin', 'committee'), 'revoke': ('admin', 'committee'), 'expire': ('admin', 'committee')}
+    ALIASES = {'datasets': 'dataset', 'applications': 'application', 'grants': 'grant', 'emergency_tickets': 'emergency_ticket'}
+    INITIAL_STATUS = {'dataset': 'registered', 'application': 'draft', 'grant': 'issued', 'emergency_ticket': 'pending'}
+    TRANSITIONS = {'dataset': {'restrict': (('registered',), 'restricted'), 'publish': (('restricted',), 'published')}, 'application': {'submit': (('draft',), 'submitted'), 'review': (('submitted',), 'under_review'), 'approve': (('under_review',), 'approved'), 'reject': (('under_review',), 'rejected'), 'withdraw': (('submitted', 'under_review'), 'withdrawn')}, 'grant': {'activate': (('issued',), 'active'), 'revoke': (('active',), 'revoked'), 'expire': (('active',), 'expired')}, 'emergency_ticket': {'approve': (('pending',), 'active'), 'expire': (('pending', 'active'), 'expired'), 'close': (('active', 'expired'), 'closed'), 'revoke': (('active', 'expired'), 'revoked')}}
+    CREATE_REQUIRED = {'dataset': ('name', 'access_policy'), 'application': ('dataset_id', 'applicant_id', 'purpose'), 'grant': ('application_id', 'dataset_id', 'recipient'), 'emergency_ticket': ('incident_id', 'dataset_id', 'applicant_id', 'purpose', 'expires_at')}
+    ACTION_REQUIRED = {('dataset', 'restrict'): ('reason',), ('application', 'review'): ('committee_id',), ('application', 'approve'): ('approvals', 'terms', 'expires_at'), ('application', 'reject'): ('reason',), ('application', 'withdraw'): ('reason',), ('grant', 'activate'): ('starts_at', 'expires_at'), ('grant', 'revoke'): ('reason',), ('grant', 'expire'): ('expired_at',), ('emergency_ticket', 'revoke'): ('reason',)}
+    CREATE_ROLES = {'dataset': ('admin', 'committee'), 'application': ('admin', 'applicant'), 'grant': ('admin', 'committee'), 'emergency_ticket': ('admin', 'applicant')}
+    ROLE_ACTIONS = {'restrict': ('admin', 'committee'), 'publish': ('admin', 'committee'), 'submit': ('admin', 'applicant'), 'review': ('admin', 'committee'), 'approve': ('admin', 'committee'), 'reject': ('admin', 'committee'), 'withdraw': ('admin', 'applicant'), 'activate': ('admin', 'committee'), 'revoke': ('admin', 'committee'), 'expire': ('admin', 'committee'), ('emergency_ticket', 'approve'): ('committee',), ('emergency_ticket', 'expire'): ('admin', 'committee', 'auditor'), ('emergency_ticket', 'close'): ('auditor',), ('emergency_ticket', 'revoke'): ('auditor',)}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
